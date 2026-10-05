@@ -196,6 +196,105 @@ def _normalize_stop(raw: Any, index: int, node_set: set[str]) -> dict:
     return {"node": node, "earliest": earliest, "latest": latest, "stay": stay}
 
 
+def _normalize_meeting_visitor(raw: Any, index: int, node_set: set[str]) -> dict:
+    """校验一名汇合查询访客。
+
+    期望格式::
+
+        {"id": "alice",              # 可选，缺省按序号生成
+         "origin": "GATE",
+         "departure_time": "2026-10-05T09:00:00Z",   # 最早出发时刻
+         "avoid_stairs": false}
+    """
+    where = f"visitors[{index}]"
+    if not isinstance(raw, dict):
+        raise ValidationError(f"{where} 必须是对象")
+    for field in ("origin", "departure_time"):
+        if field not in raw:
+            raise ValidationError(f"{where} 缺少必填字段: {field}")
+
+    origin = _clean_identifier(raw.get("origin"), f"{where}.origin")
+    if origin not in node_set:
+        raise ValidationError(f"{where}.origin 引用了未知节点: {origin!r}")
+
+    try:
+        departure = parse_time(raw["departure_time"])
+    except TimeError as exc:
+        raise ValidationError(f"{where}.departure_time: {exc}") from None
+
+    avoid_stairs = raw.get("avoid_stairs", False)
+    if not isinstance(avoid_stairs, bool):
+        raise ValidationError(f"{where}.avoid_stairs 必须是布尔值 true/false")
+
+    visitor = {
+        "id": index + 1,  # 默认按 1 起始序号
+        "origin": origin,
+        "departure": departure,
+        "avoid_stairs": avoid_stairs,
+    }
+    if "id" in raw:
+        visitor["id"] = _clean_identifier(raw.get("id"), f"{where}.id")
+    return visitor
+
+
+def normalize_meeting(payload: Any, node_set: set[str]) -> dict:
+    """校验一次多人汇合点查询负载。
+
+    期望格式::
+
+        {"visitors": [{"origin": ..., "departure_time": ...,
+                       "avoid_stairs": ...}, ...],
+         "candidates": ["PLAZA", "TOWER"],
+         "latest_meeting_time": "2026-10-05T12:00:00Z"}
+    """
+    data = _require_object(payload, "汇合查询")
+    for field in ("visitors", "candidates", "latest_meeting_time"):
+        if field not in data:
+            raise ValidationError(f"缺少必填字段: {field}")
+
+    raw_visitors = data["visitors"]
+    if not isinstance(raw_visitors, list):
+        raise ValidationError("visitors 必须是数组")
+    if len(raw_visitors) < 2:
+        raise ValidationError("visitors 至少需要包含两名访客")
+    visitors = [
+        _normalize_meeting_visitor(raw, i, node_set)
+        for i, raw in enumerate(raw_visitors)
+    ]
+    seen_ids: set = set()
+    for v in visitors:
+        if v["id"] in seen_ids:
+            raise ValidationError(f"访客标识重复: {v['id']!r}")
+        seen_ids.add(v["id"])
+
+    raw_candidates = data["candidates"]
+    if not isinstance(raw_candidates, list):
+        raise ValidationError("candidates 必须是数组")
+    if not raw_candidates:
+        raise ValidationError("candidates 不能为空")
+    candidates: list[str] = []
+    candidate_set: set[str] = set()
+    for i, raw in enumerate(raw_candidates):
+        node = _clean_identifier(raw, f"candidates[{i}]")
+        if node not in node_set:
+            raise ValidationError(f"candidates[{i}] 引用了未知节点: {node!r}")
+        if node in candidate_set:
+            raise ValidationError(f"candidates 存在重复节点: {node!r}")
+        candidate_set.add(node)
+        candidates.append(node)
+
+    try:
+        latest = parse_time(data["latest_meeting_time"])
+    except TimeError as exc:
+        raise ValidationError(f"latest_meeting_time: {exc}") from None
+
+    return {
+        "visitors": visitors,
+        "candidates": candidates,
+        "latest_meeting_time": latest,
+    }
+
+
 def normalize_query(payload: Any, node_set: set[str]) -> dict:
     """校验一次路线查询负载。"""
     data = _require_object(payload, "查询")

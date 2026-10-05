@@ -17,7 +17,13 @@ from .db import (
     publish_closures,
     publish_graph,
 )
-from .routing import NoRouteError, Stop, build_engine
+from .routing import (
+    MeetingVisitor,
+    NoMeetingCandidateError,
+    NoRouteError,
+    Stop,
+    build_engine,
+)
 from .schemas import ValidationError as PayloadValidationError
 from .timeutil import format_time
 
@@ -197,6 +203,96 @@ async def query_route(request: Request):
         result = _route_to_dict(route)
         result["data_version"] = snap.version_id
         return result
+    finally:
+        conn.close()
+
+
+def _meeting_visitor_to_dict(arrival, meeting_time: int) -> dict:
+    """单名访客的汇合结果：完整单人路线 + 到达后的等待秒数。"""
+    route = arrival.route
+    total_stay = sum(v.stay_seconds for v in route.stops)
+    result = {
+        "id": arrival.visitor.id,
+        "origin": route.origin,
+        "destination": route.destination,
+        "query_departure_time": format_time(route.departure_time),
+        "query_departure_time_epoch": route.departure_time,
+        "arrival_time": format_time(route.arrival_time),
+        "arrival_time_epoch": route.arrival_time,
+        "avoid_stairs": route.avoid_stairs,
+        "edge_sequence": [s.edge_id for s in route.segments],
+        "segments": [_segment_to_dict(s) for s in route.segments],
+        # 到达汇合点后等待全员到齐的秒数（最晚抵达者为 0）
+        "wait_after_arrival_seconds": meeting_time - route.arrival_time,
+        # 与单人路线查询一致的途中等候（封闭等候 + 等窗）
+        "total_waiting_seconds": route.arrival_time
+        - route.departure_time
+        - sum(s.travel_seconds for s in route.segments)
+        - total_stay,
+    }
+    if route.stops:
+        result["stops"] = [_stop_to_dict(v) for v in route.stops]
+        result["total_stay_seconds"] = total_stay
+    return result
+
+
+@app.post("/api/meeting")
+async def plan_meeting(request: Request):
+    """为多名访客从候选节点中选公共汇合点。整次计算固定同一数据版本。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        # 与单人路线查询一致：进入时固定版本指针，整次计算只用同一版本
+        snap = get_snapshot(conn)
+        if snap is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
+            )
+
+        from .schemas import normalize_meeting
+
+        query = normalize_meeting(payload, snap.node_set)
+        engine = build_engine(snap)
+        visitors = tuple(
+            MeetingVisitor(v["id"], v["origin"], v["departure"], v["avoid_stairs"])
+            for v in query["visitors"]
+        )
+        try:
+            plan = engine.plan_meeting(
+                visitors=visitors,
+                candidates=tuple(query["candidates"]),
+                latest_meeting_time=query["latest_meeting_time"],
+            )
+        except NoMeetingCandidateError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "no_meeting_candidate",
+                    "detail": str(exc),
+                    "data_version": snap.version_id,
+                },
+            )
+
+        return {
+            "meeting_node": plan.node,
+            "meeting_time": format_time(plan.meeting_time),
+            "meeting_time_epoch": plan.meeting_time,
+            "latest_meeting_time": format_time(query["latest_meeting_time"]),
+            "latest_meeting_time_epoch": query["latest_meeting_time"],
+            "total_arrival_seconds": plan.total_arrival_seconds,
+            "visitors": [
+                _meeting_visitor_to_dict(a, plan.meeting_time) for a in plan.arrivals
+            ],
+            "data_version": snap.version_id,
+        }
     finally:
         conn.close()
 

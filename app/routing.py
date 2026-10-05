@@ -109,6 +109,35 @@ class NoRouteError(Exception):
     """没有在约束下可行的路线。"""
 
 
+class MeetingVisitor(NamedTuple):
+    """一名汇合查询访客（查询输入，时刻为纪元秒）。"""
+
+    id: object            # 访客标识（未给 id 时为 1 起始序号）
+    origin: str
+    departure: int        # 最早出发时刻
+    avoid_stairs: bool
+
+
+class VisitorArrival(NamedTuple):
+    """一名访客到某候选点的最早到达结果。"""
+
+    visitor: MeetingVisitor
+    route: Route          # 复用既有单人路线查询语义（含全程字典序破平局）
+
+
+class MeetingPlan(NamedTuple):
+    """一次多人汇合点规划的选中结果。"""
+
+    node: str                              # 选中的汇合节点
+    meeting_time: int                      # 全员实际汇合时刻（最晚个人抵达）
+    arrivals: tuple[VisitorArrival, ...]   # 与请求 visitors 同序
+    total_arrival_seconds: int             # 个人抵达时刻总和（二级择优指标）
+
+
+class NoMeetingCandidateError(Exception):
+    """没有任何候选点能让所有人在最晚时刻前抵达。"""
+
+
 def _overlaps(enter: int, leave: int, start: int, end: int) -> bool:
     """[enter, leave) 与 [start, end) 是否重叠。"""
     return enter < end and start < leave
@@ -482,6 +511,72 @@ class RouteEngine:
             avoid_stairs=avoid_stairs,
             segments=tuple(segments),
             stops=tuple(visits),
+        )
+
+    # ------------------------------------------------------------------
+    # 多人汇合点：候选点筛选与择优
+    # ------------------------------------------------------------------
+    def plan_meeting(
+        self,
+        visitors: tuple[MeetingVisitor, ...],
+        candidates: tuple[str, ...],
+        latest_meeting_time: int,
+    ) -> MeetingPlan:
+        """在候选节点中选出全员可在最晚时刻前抵达的汇合点。
+
+        每名访客从各自最早出发时刻独立通行（封闭等候、避台阶、最早到达
+        及全程路段编号序列字典序破平局的单人路线语义不变），抵达后可在
+        汇合点等待。只接受**所有**访客抵达时刻均不晚于
+        ``latest_meeting_time`` 的候选点。
+
+        合格候选按以下顺序择优：
+        1. 全员实际汇合时刻（最晚个人抵达时刻）最早；
+        2. 个人抵达时刻总和最小；
+        3. 候选节点编号字典序最小。
+        """
+        # (汇合时刻, 抵达总和, 节点编号) 三级字典序即择优顺序
+        best_key: Optional[tuple[int, int, str]] = None
+        best_arrivals: Optional[tuple[VisitorArrival, ...]] = None
+        best_node: Optional[str] = None
+
+        for node in candidates:
+            arrivals: list[VisitorArrival] = []
+            feasible = True
+            for visitor in visitors:
+                try:
+                    route = self.plan(
+                        origin=visitor.origin,
+                        destination=node,
+                        departure=visitor.departure,
+                        avoid_stairs=visitor.avoid_stairs,
+                    )
+                except NoRouteError:
+                    feasible = False
+                    break
+                if route.arrival_time > latest_meeting_time:
+                    feasible = False
+                    break
+                arrivals.append(VisitorArrival(visitor, route))
+            if not feasible:
+                continue
+
+            meeting_time = max(a.route.arrival_time for a in arrivals)
+            total = sum(a.route.arrival_time for a in arrivals)
+            key = (meeting_time, total, node)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_node = node
+                best_arrivals = tuple(arrivals)
+
+        if best_key is None:
+            raise NoMeetingCandidateError(
+                "没有任何候选节点能让所有访客在最晚汇合时刻前抵达"
+            )
+        return MeetingPlan(
+            node=best_node,
+            meeting_time=best_key[0],
+            arrivals=best_arrivals,
+            total_arrival_seconds=best_key[1],
         )
 
 
