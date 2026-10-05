@@ -18,6 +18,7 @@ from .db import (
     publish_graph,
 )
 from .routing import NoRouteError, Stop, build_engine
+from .meeting import NoEligibleCandidateError, Visitor, plan_meeting
 from .schemas import ValidationError as PayloadValidationError
 from .timeutil import format_time
 
@@ -74,6 +75,64 @@ def _route_to_dict(route) -> dict:
         result["stops"] = [_stop_to_dict(v) for v in route.stops]
         result["total_stay_seconds"] = total_stay
     return result
+
+
+def _meeting_report_to_dict(report) -> dict:
+    return {
+        "node": report.node,
+        "feasible": report.feasible,
+        "arrivals": [
+            {"arrival_time": format_time(a), "arrival_time_epoch": a}
+            if a is not None else None
+            for a in report.arrivals
+        ],
+        "meeting_time": format_time(report.meeting_time) if report.meeting_time is not None else None,
+        "meeting_time_epoch": report.meeting_time,
+        "arrival_sum_seconds": report.arrival_sum,
+        "rejections": [
+            {
+                "visitor_index": rej.visitor_index,
+                "visitor_id": rej.visitor_id,
+                "reason": rej.reason,
+                "arrival_time": format_time(rej.arrival) if rej.arrival is not None else None,
+                "arrival_time_epoch": rej.arrival,
+            }
+            for rej in report.rejections
+        ],
+    }
+
+
+def _meeting_to_dict(plan) -> dict:
+    return {
+        "meeting_node": plan.meeting_node,
+        "node": plan.meeting_node,
+        "meeting_time": format_time(plan.meeting_time),
+        "meeting_time_epoch": plan.meeting_time,
+        "latest_meeting_time": format_time(plan.deadline),
+        "latest_meeting_time_epoch": plan.deadline,
+        "arrival_sum_seconds": plan.arrival_sum,
+        "visitors": [
+            {
+                "index": vp.index,
+                "id": vp.visitor.id,
+                "origin": vp.visitor.origin,
+                "query_departure_time": format_time(vp.visitor.departure),
+                "query_departure_time_epoch": vp.visitor.departure,
+                "avoid_stairs": vp.visitor.avoid_stairs,
+                "arrival_time": format_time(vp.arrival_time),
+                "arrival_time_epoch": vp.arrival_time,
+                "wait_after_arrival_seconds": vp.waiting_after_arrival,
+                "total_waiting_seconds": vp.route.arrival_time
+                - vp.visitor.departure
+                - sum(s.travel_seconds for s in vp.route.segments),
+                "edge_sequence": [s.edge_id for s in vp.route.segments],
+                "segments": [_segment_to_dict(s) for s in vp.route.segments],
+            }
+            for vp in plan.plans
+        ],
+        "candidates": [_meeting_report_to_dict(r) for r in plan.reports],
+        "data_version": plan.data_version,
+    }
 
 
 def _maybe_seed(conn) -> None:
@@ -197,6 +256,57 @@ async def query_route(request: Request):
         result = _route_to_dict(route)
         result["data_version"] = snap.version_id
         return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/meet")
+async def choose_meeting(request: Request):
+    """为多名访客选择公共汇合点。整次请求固定使用同一数据版本。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        # 先固定版本指针：整次汇合点计算（含所有人的路线）只用同一版本
+        snap = get_snapshot(conn)
+        if snap is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
+            )
+
+        from .schemas import normalize_meeting
+
+        query = normalize_meeting(payload, snap.node_set)
+        engine = build_engine(snap)
+        visitors = tuple(
+            Visitor(v["id"], v["origin"], v["departure"], v["avoid_stairs"])
+            for v in query["visitors"]
+        )
+        try:
+            plan = plan_meeting(
+                engine=engine,
+                visitors=visitors,
+                candidates=tuple(query["candidates"]),
+                deadline=query["deadline"],
+            )
+        except NoEligibleCandidateError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "no_eligible_candidate",
+                    "detail": str(exc),
+                    "data_version": snap.version_id,
+                },
+            )
+
+        return _meeting_to_dict(plan)
     finally:
         conn.close()
 

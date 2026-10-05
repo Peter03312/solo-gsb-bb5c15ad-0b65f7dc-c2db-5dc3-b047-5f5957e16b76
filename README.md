@@ -3,7 +3,8 @@
 面向园区访客的**离线**通行规划 HTTP 服务。导入一张带方向、通行秒数、台阶标记的
 步道图，以及按**半开时间区间** `[start, end)` 生效的封闭记录；给定起终点、出发
 时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。支持在查询中
-指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节。
+指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
+也支持为**多名访客**在候选节点中选择公共汇合点（见第 4.2 节）。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -235,6 +236,108 @@ python -m app.cli serve
 | 任一站无法按时停留（抵达已晚于 `latest_start`） | `404` | `no_route` |
 | 某站或终点不可达 | `404` | `no_route` |
 
+### 4.2 多人公共汇合点（`POST /api/meet`）
+
+为**多名访客**选一个公共汇合点。请求给出每人的起点、最早出发时刻与避台阶
+标记、非空候选节点列表以及共同的最晚汇合时刻。每人独立按现有封闭、等候与
+最早到达规则通行；到达汇合点后可在节点等待其他人。
+
+请求：
+
+```json
+{
+  "visitors": [
+    {"id": "alice", "origin": "GATE",
+     "departure_time": "2026-10-05T08:00:00Z", "avoid_stairs": false},
+    {"id": "bob", "origin": "HILL",
+     "departure_time": "2026-10-05T08:30:00Z", "avoid_stairs": true}
+  ],
+  "candidates": ["PLAZA", "TOWER"],
+  "latest_meeting_time": "2026-10-05T10:30:00Z"
+}
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `visitors` | **至少两名**访客的数组 |
+| `visitors[].id` | 可选，访客标识（非空字符串，同请求内唯一）；缺省为数组下标字符串 |
+| `visitors[].origin` | 起点（必须是已知节点） |
+| `visitors[].departure_time` | 最早出发时刻（ISO 8601 或纪元秒） |
+| `visitors[].avoid_stairs` | 可选，避台阶标记，默认 `false` |
+| `candidates` | **非空**候选节点数组，节点须已知且不重复 |
+| `latest_meeting_time` | 共同的最晚汇合时刻（闭区间：恰好在该时刻抵达算合格） |
+
+> 常见别名同样接受（取值必须一致，否则 `400`）：访客列表 `people` / `guests`；
+> 起点 `start` / `start_node` / `from`；出发时刻 `earliest_departure` /
+> `earliest_departure_time` / `earliest_start` / `departure`；避台阶
+> `stairs_free` / `step_free` / `no_stairs` / `avoid_steps`；标识
+> `visitor_id` / `name`；候选列表 `candidate_nodes`；最晚汇合时刻
+> `meeting_deadline` / `deadline` / `latest_arrival_time`。
+
+合格与择优：
+
+- 只有**所有人**都能在 `latest_meeting_time` 前（含）抵达的候选点才合格；
+  任一访客不可达或抵达更晚，该候选淘汰；
+- 候选间依次按 ① 全员实际汇合时刻（各人抵达时刻的最大值）最早；
+  ② 个人抵达时刻总和（纪元秒）最小；③ 候选节点编号字典序 选取；
+- 每人**单人路线的平局**仍按全程路段编号序列字典序打破（与 `/api/route` 一致）。
+
+响应 `200`（节选）：
+
+```json
+{
+  "meeting_node": "TOWER",
+  "meeting_time": "2026-10-05T08:32:00Z",
+  "meeting_time_epoch": 1791189120,
+  "latest_meeting_time": "2026-10-05T10:30:00Z",
+  "latest_meeting_time_epoch": 1791196200,
+  "arrival_sum_seconds": 3582376860,
+  "visitors": [
+    {
+      "index": 0, "id": "alice", "origin": "GATE",
+      "query_departure_time": "2026-10-05T08:00:00Z",
+      "avoid_stairs": false,
+      "arrival_time": "2026-10-05T08:09:00Z",
+      "wait_after_arrival_seconds": 1380,
+      "total_waiting_seconds": 0,
+      "edge_sequence": ["E1", "E2", "E4"],
+      "segments": ["... 与 /api/route 相同的逐段结构 ..."]
+    }
+  ],
+  "candidates": [
+    {
+      "node": "PLAZA", "feasible": false,
+      "arrivals": [{"arrival_time": "2026-10-05T08:03:00Z",
+                    "arrival_time_epoch": 1791187380}, null],
+      "meeting_time": null, "arrival_sum_seconds": null,
+      "rejections": [{"visitor_index": 1, "visitor_id": "bob",
+                      "reason": "unreachable", "arrival_time": null}]
+    }
+  ],
+  "data_version": 2
+}
+```
+
+- `visitors[i].wait_after_arrival_seconds` 为该人抵达汇合点后等待其他人的秒数
+  （= `meeting_time - arrival_time`）；`total_waiting_seconds` 仍是通行途中因
+  封闭产生的等候；`segments` 与 `/api/route` 逐段结构一致；
+- `candidates` 按请求顺序给出每个候选的可行性、各人最早抵达、实际汇合时刻、
+  抵达总和；不可行项在 `rejections` 中逐人给出 `unreachable`（不可达）或
+  `late`（最早抵达也晚于最晚汇合时刻，并附实际最早抵达）。
+
+错误：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 访客少于两人、字段非法、时间格式错误、节点（起点/候选）未知、候选为空或重复、访客标识重复、别名字段取值冲突等 | `400` | `invalid_payload` |
+| 没有任何候选点能让所有人在最晚汇合时刻前抵达 | `404` | `no_eligible_candidate` |
+| 尚未导入步道图（空图） | `503` | `no_data` |
+
+整次计算（所有人的全部路线）固定使用请求开始时读到的**同一数据版本**，
+`data_version` 在顶层返回。
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -312,6 +415,33 @@ curl -s -X POST http://localhost:8080/api/route \
 python3 scripts/smoke_test.py http://localhost:8080
 ```
 
+多人汇合点示例：
+
+```bash
+# alice 08:00 从 GATE 出发，bob 08:30 从 HILL 出发；候选 PLAZA/TOWER，最晚 10:30
+# PLAZA 对 HILL 不可达（有向图）；TOWER 上 alice 08:09 到、bob 08:32 到 → 选 TOWER
+curl -s -X POST http://localhost:8080/api/meet \
+  -H 'Content-Type: application/json' \
+  -d '{"visitors":[
+         {"id":"alice","origin":"GATE","departure_time":"2026-10-05T08:00:00Z"},
+         {"id":"bob","origin":"HILL","departure_time":"2026-10-05T08:30:00Z"}
+       ],
+       "candidates":["PLAZA","TOWER"],
+       "latest_meeting_time":"2026-10-05T10:30:00Z"}'
+# 结果要点：meeting_node=TOWER，meeting_time=08:32；
+#   alice 08:09 到，wait_after_arrival_seconds=1380；bob 08:32 到，等待 0。
+
+# 全员都无法在最晚时刻前抵达 → 404 no_eligible_candidate
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/meet \
+  -H 'Content-Type: application/json' \
+  -d '{"visitors":[
+         {"origin":"GATE","departure_time":"2026-10-05T08:00:00Z"},
+         {"origin":"HILL","departure_time":"2026-10-05T08:30:00Z"}
+       ],
+       "candidates":["TOWER"],
+       "latest_meeting_time":"2026-10-05T08:31:00Z"}'
+```
+
 Python 示例：
 
 ```python
@@ -352,7 +482,8 @@ print(route["arrival_time"], route["edge_sequence"])
   - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
     失败整体回滚；
   - 每次查询在开始时读取一次 `current_version` 并固定，**整次请求只用同一版本**，
-    导入进行中或刚完成都不会看到半个版本；
+    导入进行中或刚完成都不会看到半个版本；多人汇合点请求中所有人的全部路线
+    同样固定在该次请求开始时的同一版本；
   - 历史版本在库中保留，可按版本号追溯。
 
 ---
@@ -366,12 +497,14 @@ app/
   schemas.py       # 导入/查询负载校验（含停靠点 stops）
   db.py            # SQLite 版本化与原子发布
   routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠）
+  meeting.py       # 多人公共汇合点选择（候选评估、择优、逐人路线重放）
+  schemas.py       # 导入/查询负载校验（含停靠点 stops、汇合点 meet）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（63 个用例）
+tests/             # 标准库 unittest 测试（93 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -385,4 +518,6 @@ python3 -m unittest discover -s tests -v
 
 测试覆盖半开区间边界、节点等候、封闭穿越判定、方向、避台阶、字典序平局、
 按顺序停靠（窗口等待、顺序约束、全程字典序、起点/终点即站点）、
+多人汇合点（可行性、汇合时刻/抵达总和/节点编号三级择优、单人字典序平局、
+到达后等待、封闭与避台阶、输入校验）、
 无路线、原子发布回滚与版本快照等场景。

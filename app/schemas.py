@@ -230,3 +230,130 @@ def normalize_query(payload: Any, node_set: set[str]) -> dict:
         "avoid_stairs": avoid_stairs,
         "stops": stops,
     }
+
+
+# -----------------------------------------------------------------------
+# 多人汇合点选择
+# -----------------------------------------------------------------------
+def _pick_alias(data: dict, names: tuple[str, ...], where: str, required: bool = True,
+                default=None):
+    """从负载中按候选字段名取值；多个别名同时出现且值不同视为非法。"""
+    present = [(name, data[name]) for name in names if name in data]
+    if not present:
+        if required:
+            raise ValidationError(f"{where} 缺少必填字段: {names[0]}")
+        return default
+    (canonical, value), rest = present[0], present[1:]
+    for other_name, other_value in rest:
+        if other_value != value:
+            raise ValidationError(
+                f"{where} 的别名字段 {canonical!r} 与 {other_name!r} 取值不一致"
+            )
+    return value
+
+
+def _normalize_visitor(raw: Any, index: int, node_set: set[str]) -> dict:
+    """校验一名访客的起点 / 最早出发时刻 / 避台阶标记。"""
+    where = f"visitors[{index}]"
+    if not isinstance(raw, dict):
+        raise ValidationError(f"{where} 必须是对象")
+
+    origin = _clean_identifier(
+        _pick_alias(raw, ("origin", "start", "start_node", "from"), where),
+        f"{where}.origin",
+    )
+    if origin not in node_set:
+        raise ValidationError(f"{where}.origin 引用了未知节点: {origin!r}")
+
+    raw_departure = _pick_alias(
+        raw, ("departure_time", "earliest_departure", "earliest_departure_time",
+              "earliest_start", "departure"),
+        where,
+    )
+    try:
+        departure = parse_time(raw_departure)
+    except TimeError as exc:
+        raise ValidationError(f"{where}.departure_time: {exc}") from None
+
+    avoid_stairs = _pick_alias(
+        raw, ("avoid_stairs", "stairs_free", "step_free", "no_stairs", "avoid_steps"),
+        where, required=False, default=False,
+    )
+    if not isinstance(avoid_stairs, bool):
+        raise ValidationError(f"{where}.avoid_stairs 必须是布尔值 true/false")
+
+    visitor_id = _pick_alias(
+        raw, ("id", "visitor_id", "name"), where, required=False, default=None,
+    )
+    if visitor_id is not None:
+        visitor_id = _clean_identifier(visitor_id, f"{where}.id")
+
+    return {
+        "origin": origin,
+        "departure": departure,
+        "avoid_stairs": avoid_stairs,
+        "id": visitor_id if visitor_id is not None else str(index),
+    }
+
+
+def normalize_meeting(payload: Any, node_set: set[str]) -> dict:
+    """校验一次多人汇合点选择负载。
+
+    期望格式::
+
+        {
+          "visitors": [
+            {"origin": "GATE", "departure_time": "2026-10-05T09:00:00Z",
+             "avoid_stairs": false},
+            ...
+          ],
+          "candidates": ["PLAZA", "TOWER"],
+          "latest_meeting_time": "2026-10-05T10:00:00Z"
+        }
+    """
+    data = _require_object(payload, "汇合点查询")
+
+    raw_visitors = _pick_alias(data, ("visitors", "people", "guests"), "请求")
+    if not isinstance(raw_visitors, list):
+        raise ValidationError("visitors 必须是数组")
+    if len(raw_visitors) < 2:
+        raise ValidationError("visitors 至少需要包含两名访客")
+    visitors = [_normalize_visitor(raw, i, node_set) for i, raw in enumerate(raw_visitors)]
+
+    seen_ids: set[str] = set()
+    for v in visitors:
+        if v["id"] in seen_ids:
+            raise ValidationError(f"访客标识重复: {v['id']!r}")
+        seen_ids.add(v["id"])
+
+    raw_candidates = _pick_alias(data, ("candidates", "candidate_nodes"), "请求")
+    if not isinstance(raw_candidates, list):
+        raise ValidationError("candidates 必须是数组")
+    if not raw_candidates:
+        raise ValidationError("candidates 不能为空")
+    candidates: list[str] = []
+    seen_nodes: set[str] = set()
+    for i, raw_node in enumerate(raw_candidates):
+        node = _clean_identifier(raw_node, f"candidates[{i}]")
+        if node not in node_set:
+            raise ValidationError(f"candidates[{i}] 引用了未知节点: {node!r}")
+        if node in seen_nodes:
+            raise ValidationError(f"候选节点重复: {node!r}")
+        seen_nodes.add(node)
+        candidates.append(node)
+
+    raw_deadline = _pick_alias(
+        data, ("latest_meeting_time", "meeting_deadline", "deadline",
+               "latest_arrival_time"),
+        "请求",
+    )
+    try:
+        deadline = parse_time(raw_deadline)
+    except TimeError as exc:
+        raise ValidationError(f"latest_meeting_time: {exc}") from None
+
+    return {
+        "visitors": visitors,
+        "candidates": candidates,
+        "deadline": deadline,
+    }

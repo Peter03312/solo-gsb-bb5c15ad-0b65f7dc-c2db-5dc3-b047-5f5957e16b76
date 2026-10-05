@@ -140,6 +140,63 @@ def main() -> int:
     }, expect_status=400)
     assert bad5["error"] == "invalid_payload", bad5
 
+    # 10. 多人汇合点：PLAZA 08:30 汇合（bob 起点），TOWER 08:36 → 选 PLAZA
+    #     alice 08:00 从 GATE 出发 08:03 抵 PLAZA，等 1620 秒
+    status, meet = call("POST", "/api/meet", {
+        "visitors": [
+            {"id": "alice", "origin": "GATE",
+             "departure_time": "2026-10-05T08:00:00Z", "avoid_stairs": True},
+            {"id": "bob", "origin": "PLAZA",
+             "departure_time": "2026-10-05T08:30:00Z"},
+        ],
+        "candidates": ["PLAZA", "TOWER"],
+        "latest_meeting_time": "2026-10-05T10:30:00Z",
+    })
+    assert status == 200, meet
+    assert meet["meeting_node"] == "PLAZA", meet
+    assert meet["meeting_time"] == "2026-10-05T08:30:00Z", meet
+    va, vb = meet["visitors"]
+    assert va["edge_sequence"] == ["E1"], va          # 避台阶到 PLAZA 只需 E1
+    assert va["arrival_time"] == "2026-10-05T08:03:00Z", va
+    assert va["wait_after_arrival_seconds"] == 1620, va
+    assert vb["arrival_time"] == "2026-10-05T08:30:00Z", vb
+    assert vb["wait_after_arrival_seconds"] == 0, vb
+    print("汇合选择:", meet["meeting_node"], meet["meeting_time"],
+          "v" + str(meet["data_version"]))
+
+    # 11. 汇合点不可行（所有人都无法在最晚时刻前抵达）→ 404
+    status, meet404 = call("POST", "/api/meet", {
+        "visitors": [
+            {"origin": "GATE", "departure_time": "2026-10-05T08:00:00Z"},
+            {"origin": "HILL", "departure_time": "2026-10-05T08:30:00Z"},
+        ],
+        "candidates": ["TOWER"],
+        "latest_meeting_time": "2026-10-05T08:31:00Z",
+    }, expect_status=404)
+    assert meet404["error"] == "no_eligible_candidate", meet404
+
+    # 12. 汇合请求字段非法：只有一名访客 / 未知节点 / 空候选 → 400
+    for bad_meet in (
+        {"visitors": [{"origin": "GATE",
+                       "departure_time": "2026-10-05T08:00:00Z"}],
+         "candidates": ["TOWER"],
+         "latest_meeting_time": "2026-10-05T10:00:00Z"},
+        {"visitors": [{"origin": "GHOST",
+                       "departure_time": "2026-10-05T08:00:00Z"},
+                      {"origin": "HILL",
+                       "departure_time": "2026-10-05T08:00:00Z"}],
+         "candidates": ["TOWER"],
+         "latest_meeting_time": "2026-10-05T10:00:00Z"},
+        {"visitors": [{"origin": "GATE",
+                       "departure_time": "2026-10-05T08:00:00Z"},
+                      {"origin": "HILL",
+                       "departure_time": "2026-10-05T08:00:00Z"}],
+         "candidates": [],
+         "latest_meeting_time": "2026-10-05T10:00:00Z"},
+    ):
+        status, badm = call("POST", "/api/meet", bad_meet, expect_status=400)
+        assert badm["error"] == "invalid_payload", badm
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

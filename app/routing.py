@@ -176,6 +176,16 @@ class RouteEngine:
                     heapq.heappush(heap, (arrival, edge.dst))
         return dist
 
+    def earliest_arrivals(
+        self, origin: str, departure: int, avoid_stairs: bool = False
+    ) -> dict[str, int]:
+        """从 ``origin`` 在 ``departure`` 出发，各可达节点的最早到达时刻映射。
+
+        汇合点选择对每位访客只需一次第一阶段计算即可评估全部候选点；
+        映射中不含不可达节点，起点自身映射为出发时刻。
+        """
+        return self._earliest_arrival_map(origin, departure, avoid_stairs)
+
     # ------------------------------------------------------------------
     # 第二阶段：最早到达前提下，路段编号序列字典序最小
     # ------------------------------------------------------------------
